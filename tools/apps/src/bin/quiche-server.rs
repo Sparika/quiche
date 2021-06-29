@@ -27,6 +27,10 @@
 #[macro_use]
 extern crate log;
 
+use std::cmp;
+
+use std::io;
+
 use std::net;
 
 use std::io::prelude::*;
@@ -43,13 +47,15 @@ use quiche_apps::args::*;
 
 use quiche_apps::common::*;
 
+const MAX_BUF_SIZE: usize = 65536;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-const MAX_SEND_BURST_LIMIT: usize = MAX_DATAGRAM_SIZE * 10;
+const MAX_SEND_BURST_PACKETS: usize = 10;
 
 fn main() {
-    let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut buf = [0; MAX_BUF_SIZE];
+    let mut out = [0; MAX_BUF_SIZE];
 
     env_logger::builder()
         .default_format_timestamp_nanos(true)
@@ -78,6 +84,11 @@ fn main() {
     )
     .unwrap();
 
+    let max_datagram_size = MAX_DATAGRAM_SIZE;
+    let enable_gso = detect_gso(&socket, max_datagram_size);
+
+    trace!("GSO detected: {}", enable_gso);
+
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
@@ -87,8 +98,8 @@ fn main() {
     config.set_application_protos(&conn_args.alpns).unwrap();
 
     config.set_max_idle_timeout(conn_args.idle_timeout);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_recv_udp_payload_size(max_datagram_size);
+    config.set_max_send_udp_payload_size(max_datagram_size);
     config.set_initial_max_data(conn_args.max_data);
     config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
     config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
@@ -342,6 +353,11 @@ fn main() {
                     siduck_conn: None,
                     app_proto_selected: false,
                     bytes_sent: 0,
+                    max_datagram_size,
+                    max_send_burst: cmp::min(
+                        MAX_BUF_SIZE,
+                        max_datagram_size * MAX_SEND_BURST_PACKETS,
+                    ),
                 };
 
                 clients.insert(scid.clone(), client);
@@ -415,6 +431,14 @@ fn main() {
 
                     client.app_proto_selected = true;
                 }
+
+                // Update max_datagram_size after connection established.
+                client.max_datagram_size =
+                    client.conn.max_send_udp_payload_size();
+                client.max_send_burst = cmp::min(
+                    MAX_BUF_SIZE,
+                    client.max_datagram_size * MAX_SEND_BURST_PACKETS,
+                );
             }
 
             if client.http_conn.is_some() {
@@ -458,39 +482,76 @@ fn main() {
         // packets to be sent.
         continue_write = false;
         for client in clients.values_mut() {
-            loop {
-                let (write, send_info) = match client.conn.send(&mut out) {
-                    Ok(v) => v,
+            let max_send_burst = client.max_send_burst;
+            let mut total_write = 0;
+            let mut dst_info = None;
+            let mut is_done = false;
 
-                    Err(quiche::Error::Done) => {
-                        trace!("{} done writing", client.conn.trace_id());
+            'write: loop {
+                while total_write < max_send_burst {
+                    let (write, send_info) = match client
+                        .conn
+                        .send(&mut out[total_write..max_send_burst])
+                    {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => {
+                            trace!("{} done writing", client.conn.trace_id());
+                            is_done = true;
+                            break;
+                        },
+
+                        Err(e) => {
+                            error!(
+                                "{} send failed: {:?}",
+                                client.conn.trace_id(),
+                                e
+                            );
+
+                            client.conn.close(false, 0x1, b"fail").ok();
+                            break 'write;
+                        },
+                    };
+
+                    total_write += write;
+
+                    dst_info = Some(send_info);
+
+                    // No GSO, or last packet.
+                    if !enable_gso || write < client.max_datagram_size {
                         break;
-                    },
+                    }
+                }
 
-                    Err(e) => {
-                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
+                if total_write == 0 || dst_info.is_none() || is_done {
+                    break;
+                }
 
-                        client.conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
-
-                // TODO: coalesce packets.
-                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+                if let Err(e) = send_to(
+                    &socket,
+                    &out[..total_write],
+                    &dst_info.unwrap().to,
+                    client.max_datagram_size,
+                ) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         trace!("send() would block");
                         break;
                     }
 
-                    panic!("send() failed: {:?}", e);
+                    panic!("send_to() failed: {:?}", e);
                 }
 
-                trace!("{} written {} bytes", client.conn.trace_id(), write);
+                trace!(
+                    "{} written {} bytes",
+                    client.conn.trace_id(),
+                    total_write
+                );
 
                 // limit write bursting
-                client.bytes_sent += write;
+                client.bytes_sent += total_write;
+                total_write = 0;
 
-                if client.bytes_sent >= MAX_SEND_BURST_LIMIT {
+                if client.bytes_sent >= max_send_burst {
                     trace!(
                         "{} pause writing at {}",
                         client.conn.trace_id(),
@@ -574,4 +635,66 @@ fn validate_token<'a>(
     }
 
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+}
+
+/// For Linux, try to detect GSO is available.
+#[cfg(target_os = "linux")]
+fn detect_gso(socket: &mio::net::UdpSocket, segment_size: usize) -> bool {
+    use nix::sys::socket::setsockopt;
+    use nix::sys::socket::sockopt::UdpGsoSegment;
+    use std::os::unix::io::AsRawFd;
+
+    setsockopt(socket.as_raw_fd(), UdpGsoSegment, &(segment_size as i32)).is_ok()
+}
+
+/// For non-Linux, there is no GSO support.
+#[cfg(not(target_os = "linux"))]
+fn detect_gso(_socket: &mio::net::UdpSocket, _segment_size: usize) -> bool {
+    false
+}
+
+/// When GSO enabled, send packets using sendmsg().
+#[cfg(target_os = "linux")]
+fn send_to(
+    socket: &mio::net::UdpSocket, buf: &[u8], target: &net::SocketAddr,
+    segment_size: usize,
+) -> io::Result<usize> {
+    use nix::sys::socket::sendmsg;
+    use nix::sys::socket::ControlMessage;
+    use nix::sys::socket::InetAddr;
+    use nix::sys::socket::MsgFlags;
+    use nix::sys::socket::SockAddr;
+    use nix::sys::uio::IoVec;
+    use std::os::unix::io::AsRawFd;
+
+    let iov = [IoVec::from_slice(buf)];
+    let segment_size = segment_size as u16;
+    let cmsg = ControlMessage::UdpGsoSegments(&segment_size);
+    let dst = SockAddr::new_inet(InetAddr::from_std(target));
+
+    match sendmsg(
+        socket.as_raw_fd(),
+        &iov,
+        &[cmsg],
+        MsgFlags::empty(),
+        Some(&dst),
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let e = match e.as_errno() {
+                Some(v) => io::Error::from(v),
+                None => io::Error::new(io::ErrorKind::Other, e),
+            };
+            Err(e)
+        },
+    }
+}
+
+/// When GSO disabled, send a packet using send_to().
+#[cfg(not(target_os = "linux"))]
+fn send_to(
+    socket: &mio::net::UdpSocket, buf: &[u8], target: &net::SocketAddr,
+    _segment_size: usize,
+) -> io::Result<usize> {
+    socket.send_to(buf, target)
 }
